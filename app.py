@@ -1,316 +1,285 @@
-# app.py
-import streamlit as st
-import PyPDF2
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-import nltk
-from collections import Counter
-import re
-import io
-from sklearn.feature_extraction.text import TfidfVectorizer
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, Loader2, FileText, Trash2, BookOpen } from 'lucide-react';
 
-# Download NLTK data
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords', quiet=True)
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+const RAGChatbot = () => {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [context, setContext] = useState('');
+  const [showContext, setShowContext] = useState(false);
+  const messagesEndRef = useRef(null);
 
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize, sent_tokenize
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
 
-# Page config
-st.set_page_config(page_title="PDF RAG Chat", page_icon="📄", layout="wide")
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pdf_processed" not in st.session_state:
-    st.session_state.pdf_processed = False
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-if "full_text" not in st.session_state:
-    st.session_state.full_text = ""
-if "page_count" not in st.session_state:
-    st.session_state.page_count = 0
-if "embedder" not in st.session_state:
-    st.session_state.embedder = None
-if "llm" not in st.session_state:
-    st.session_state.llm = None
-if "tokenizer" not in st.session_state:
-    st.session_state.tokenizer = None
-
-
-@st.cache_resource
-def load_embedder():
-    """Load sentence transformer model for embeddings."""
-    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-
-
-@st.cache_resource
-def load_llm():
-    """Load local LLM for text generation."""
-    tokenizer = AutoTokenizer.from_pretrained('distilgpt2')
-    tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained('distilgpt2')
-    gen_pipeline = pipeline('text-generation', model=model, tokenizer=tokenizer, max_new_tokens=150, temperature=0.7)
-    return gen_pipeline, tokenizer
-
-
-def extract_text_from_pdf(pdf_file):
-    """Extract text from uploaded PDF file."""
-    try:
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        page_count = len(pdf_reader.pages)
-        full_text = ""
-        
-        for page in pdf_reader.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
-        
-        return full_text.strip(), page_count
-    except Exception as e:
-        st.error(f"Error reading PDF: {str(e)}")
-        return None, 0
-
-
-def chunk_text(text, chunk_size=500, overlap=50):
-    """Split text into overlapping chunks."""
-    chunks = []
-    start = 0
-    text_len = len(text)
+  // Sample knowledge base - in a real app, this would be from uploaded documents
+  const knowledgeBase = `
+    Claude is an AI assistant created by Anthropic. Claude is helpful, harmless, and honest.
     
-    while start < text_len:
-        end = start + chunk_size
-        chunk = text[start:end]
-        if chunk.strip():
-            chunks.append(chunk.strip())
-        start += chunk_size - overlap
+    Anthropic was founded in 2021 by Dario Amodei and Daniela Amodei, along with several other former members of OpenAI.
+    The company focuses on AI safety and research.
     
-    return chunks
+    Claude can help with a wide variety of tasks including writing, analysis, math, coding, and creative projects.
+    Claude is designed to be helpful, harmless, and honest in all interactions.
+    
+    The latest version of Claude is part of the Claude 3 model family, which includes Claude 3 Opus, Claude 3 Sonnet, and Claude 3 Haiku.
+    These models offer different balances of intelligence, speed, and cost.
+  `;
 
+  // Simple keyword-based retrieval (mimics vector similarity)
+  const retrieveRelevantContext = (query) => {
+    const sentences = knowledgeBase.split('\n').filter(s => s.trim());
+    const queryWords = query.toLowerCase().split(' ');
+    
+    // Score each sentence based on keyword matches
+    const scoredSentences = sentences.map(sentence => {
+      const sentenceLower = sentence.toLowerCase();
+      const score = queryWords.reduce((acc, word) => {
+        return acc + (sentenceLower.includes(word) ? 1 : 0);
+      }, 0);
+      return { sentence, score };
+    });
 
-def create_vector_store(chunks, embedder):
-    """Create FAISS vector store from text chunks."""
-    if not chunks:
-        return None
-    
-    embeddings = embedder.encode(chunks, show_progress_bar=False)
-    embeddings = np.array(embeddings).astype('float32')
-    
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    
-    return index
+    // Get top 3 relevant sentences
+    const topSentences = scoredSentences
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map(s => s.sentence);
 
+    return topSentences.join('\n');
+  };
 
-def retrieve_context(query, vectorstore, chunks, embedder, top_k=3):
-    """Retrieve most relevant chunks for a query."""
-    if vectorstore is None or not chunks:
-        return ""
+  // Simulate API call to Hugging Face model
+  const generateResponse = async (userMessage, relevantContext) => {
+    // In a real implementation, you would call Hugging Face API here
+    // For demo purposes, we'll create a rule-based response
     
-    query_embedding = embedder.encode([query], show_progress_bar=False)
-    query_embedding = np.array(query_embedding).astype('float32')
-    
-    distances, indices = vectorstore.search(query_embedding, top_k)
-    
-    context_chunks = [chunks[i] for i in indices[0] if i < len(chunks)]
-    return "\n\n".join(context_chunks)
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate API delay
 
-
-def generate_answer(query, context, llm, tokenizer):
-    """Generate answer using local LLM with retrieved context."""
-    prompt = f"Context: {context[:800]}\n\nQuestion: {query}\n\nAnswer:"
+    const messageLower = userMessage.toLowerCase();
     
-    try:
-        response = llm(prompt, max_new_tokens=100, num_return_sequences=1, do_sample=True)
-        answer = response[0]['generated_text']
-        
-        # Extract only the generated answer part
-        if "Answer:" in answer:
-            answer = answer.split("Answer:")[-1].strip()
-        else:
-            answer = answer[len(prompt):].strip()
-        
-        # Clean up the answer
-        answer = answer.split("\n")[0].strip()
-        
-        return answer if answer else "I couldn't generate a relevant answer based on the context."
-    except Exception as e:
-        return f"Error generating answer: {str(e)}"
-
-
-def calculate_statistics(text):
-    """Calculate PDF statistics."""
-    # Word count
-    words = re.findall(r'\b\w+\b', text.lower())
-    total_words = len(words)
-    
-    # Remove stopwords for frequency analysis
-    stop_words = set(stopwords.words('english'))
-    filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
-    
-    # Most common words
-    word_freq = Counter(filtered_words)
-    top_words = word_freq.most_common(10)
-    
-    # Extractive summary using TF-IDF
-    sentences = sent_tokenize(text)
-    if len(sentences) > 0:
-        try:
-            vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-            if len(sentences) >= 3:
-                tfidf_matrix = vectorizer.fit_transform(sentences)
-                sentence_scores = tfidf_matrix.sum(axis=1).A1
-                top_indices = sentence_scores.argsort()[-3:][::-1]
-                summary = " ".join([sentences[i] for i in sorted(top_indices)])
-            else:
-                summary = " ".join(sentences[:3])
-        except:
-            summary = " ".join(sentences[:3])
-    else:
-        summary = "No summary available."
-    
-    return {
-        "total_words": total_words,
-        "top_words": top_words,
-        "summary": summary
+    if (!relevantContext) {
+      return "I don't have enough information in my knowledge base to answer that question. Please try asking something else or add more context to my knowledge base.";
     }
 
-
-def reset_session():
-    """Reset all session state variables."""
-    st.session_state.messages = []
-    st.session_state.pdf_processed = False
-    st.session_state.vectorstore = None
-    st.session_state.chunks = []
-    st.session_state.full_text = ""
-    st.session_state.page_count = 0
-
-
-# Main UI
-st.title("📄 PDF RAG Chat Application")
-st.markdown("Upload a PDF, chat with its content, and generate statistics - all running locally!")
-
-# Sidebar
-with st.sidebar:
-    st.header("📤 Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    // Create a contextual response based on retrieved information
+    let response = "Based on the information I have:\n\n";
     
-    if uploaded_file is not None:
-        if st.button("Process PDF", type="primary"):
-            with st.spinner("Processing PDF..."):
-                # Load models
-                if st.session_state.embedder is None:
-                    st.session_state.embedder = load_embedder()
-                if st.session_state.llm is None:
-                    st.session_state.llm, st.session_state.tokenizer = load_llm()
-                
-                # Extract text
-                full_text, page_count = extract_text_from_pdf(uploaded_file)
-                
-                if full_text:
-                    st.session_state.full_text = full_text
-                    st.session_state.page_count = page_count
-                    
-                    # Create chunks and vector store
-                    chunks = chunk_text(full_text)
-                    st.session_state.chunks = chunks
-                    
-                    vectorstore = create_vector_store(chunks, st.session_state.embedder)
-                    st.session_state.vectorstore = vectorstore
-                    
-                    st.session_state.pdf_processed = True
-                    st.success(f"✅ PDF processed! {page_count} pages, {len(chunks)} chunks created.")
-                else:
-                    st.error("Failed to extract text from PDF.")
+    if (messageLower.includes('who') || messageLower.includes('what is claude')) {
+      response += "Claude is an AI assistant created by Anthropic, designed to be helpful, harmless, and honest. ";
+    } else if (messageLower.includes('anthropic')) {
+      response += "Anthropic was founded in 2021 by Dario Amodei and Daniela Amodei. The company focuses on AI safety and research. ";
+    } else if (messageLower.includes('help') || messageLower.includes('do')) {
+      response += "Claude can help with various tasks including writing, analysis, math, coding, and creative projects. ";
+    } else if (messageLower.includes('version') || messageLower.includes('model')) {
+      response += "The latest Claude models are part of the Claude 3 family, which includes Opus, Sonnet, and Haiku variants. ";
+    } else {
+      response += relevantContext.split('\n')[0] + " ";
+    }
     
-    if st.session_state.pdf_processed:
-        st.markdown("---")
-        st.markdown(f"**Pages:** {st.session_state.page_count}")
-        st.markdown(f"**Chunks:** {len(st.session_state.chunks)}")
-        
-        if st.button("🗑️ Reset"):
-            reset_session()
-            st.rerun()
+    response += "\n\nIs there anything specific you'd like to know more about?";
+    
+    return response;
+  };
 
-# Main content
-if not st.session_state.pdf_processed:
-    st.info("👈 Please upload and process a PDF file to start chatting.")
-else:
-    # Tabs for chat and statistics
-    tab1, tab2 = st.tabs(["💬 Chat", "📊 Statistics"])
-    
-    with tab1:
-        st.subheader("Chat with Your PDF")
-        
-        # Display chat messages
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-        
-        # Chat input
-        if prompt := st.chat_input("Ask a question about the PDF..."):
-            # Add user message
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
+  const handleSend = async () => {
+    if (!input.trim() || loading) return;
+
+    const userMessage = input.trim();
+    setInput('');
+    setLoading(true);
+
+    // Add user message
+    const newMessages = [...messages, { role: 'user', content: userMessage }];
+    setMessages(newMessages);
+
+    try {
+      // Retrieve relevant context using RAG
+      const relevantContext = retrieveRelevantContext(userMessage);
+      setContext(relevantContext);
+
+      // Generate response using the context
+      const response = await generateResponse(userMessage, relevantContext);
+
+      // Add assistant message
+      setMessages([...newMessages, { role: 'assistant', content: response }]);
+    } catch (error) {
+      setMessages([...newMessages, { 
+        role: 'assistant', 
+        content: 'Sorry, I encountered an error. Please try again.' 
+      }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const clearChat = () => {
+    setMessages([]);
+    setContext('');
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+      {/* Header */}
+      <div className="bg-white shadow-md border-b border-gray-200 p-4">
+        <div className="max-w-4xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-indigo-600 p-2 rounded-lg">
+              <BookOpen className="text-white" size={24} />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-gray-800">RAG Chatbot</h1>
+              <p className="text-sm text-gray-600">Powered by Retrieval-Augmented Generation</p>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowContext(!showContext)}
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition-colors"
+            >
+              <FileText size={18} />
+              {showContext ? 'Hide' : 'Show'} Context
+            </button>
+            <button
+              onClick={clearChat}
+              className="flex items-center gap-2 px-4 py-2 bg-red-100 text-red-700 rounded-lg hover:bg-red-200 transition-colors"
+            >
+              <Trash2 size={18} />
+              Clear
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 overflow-hidden flex max-w-4xl w-full mx-auto gap-4 p-4">
+        {/* Chat Area */}
+        <div className={`flex flex-col bg-white rounded-xl shadow-lg overflow-hidden transition-all ${showContext ? 'w-2/3' : 'w-full'}`}>
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            {messages.length === 0 ? (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center space-y-4">
+                  <div className="bg-indigo-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto">
+                    <BookOpen className="text-indigo-600" size={32} />
+                  </div>
+                  <h2 className="text-2xl font-semibold text-gray-700">Welcome to RAG Chatbot!</h2>
+                  <p className="text-gray-500 max-w-md">
+                    This chatbot uses Retrieval-Augmented Generation to answer questions based on a knowledge base.
+                    Try asking about Claude or Anthropic!
+                  </p>
+                  <div className="bg-gray-50 p-4 rounded-lg max-w-md mx-auto text-left">
+                    <p className="text-sm font-semibold text-gray-700 mb-2">Try asking:</p>
+                    <ul className="text-sm text-gray-600 space-y-1">
+                      <li>• What is Claude?</li>
+                      <li>• Who founded Anthropic?</li>
+                      <li>• What can Claude help with?</li>
+                      <li>• What are the Claude 3 models?</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                {messages.map((message, index) => (
+                  <div
+                    key={index}
+                    className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[80%] rounded-2xl px-4 py-3 ${
+                        message.role === 'user'
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-gray-100 text-gray-800'
+                      }`}
+                    >
+                      <p className="whitespace-pre-wrap">{message.content}</p>
+                    </div>
+                  </div>
+                ))}
+                {loading && (
+                  <div className="flex justify-start">
+                    <div className="bg-gray-100 rounded-2xl px-4 py-3 flex items-center gap-2">
+                      <Loader2 className="animate-spin text-indigo-600" size={18} />
+                      <span className="text-gray-600">Thinking...</span>
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </>
+            )}
+          </div>
+
+          {/* Input Area */}
+          <div className="border-t border-gray-200 p-4 bg-gray-50">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="Ask me anything about Claude or Anthropic..."
+                className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                disabled={loading}
+              />
+              <button
+                onClick={handleSend}
+                disabled={loading || !input.trim()}
+                className="px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+              >
+                {loading ? (
+                  <Loader2 className="animate-spin" size={20} />
+                ) : (
+                  <Send size={20} />
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Context Panel */}
+        {showContext && (
+          <div className="w-1/3 bg-white rounded-xl shadow-lg p-6 overflow-y-auto">
+            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+              <FileText size={20} className="text-indigo-600" />
+              Retrieved Context
+            </h3>
+            {context ? (
+              <div className="bg-indigo-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-700 whitespace-pre-wrap">{context}</p>
+              </div>
+            ) : (
+              <div className="text-center text-gray-400 py-8">
+                <FileText size={48} className="mx-auto mb-2 opacity-50" />
+                <p className="text-sm">No context retrieved yet</p>
+                <p className="text-xs mt-1">Ask a question to see relevant information</p>
+              </div>
+            )}
             
-            # Generate response
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    context = retrieve_context(
-                        prompt,
-                        st.session_state.vectorstore,
-                        st.session_state.chunks,
-                        st.session_state.embedder
-                    )
-                    
-                    answer = generate_answer(
-                        prompt,
-                        context,
-                        st.session_state.llm,
-                        st.session_state.tokenizer
-                    )
-                    
-                    st.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-    
-    with tab2:
-        st.subheader("PDF Statistics")
-        
-        if st.button("Generate Statistics", type="primary"):
-            with st.spinner("Calculating statistics..."):
-                stats = calculate_statistics(st.session_state.full_text)
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.metric("Total Pages", st.session_state.page_count)
-                    st.metric("Total Words", f"{stats['total_words']:,}")
-                
-                with col2:
-                    st.metric("Total Chunks", len(st.session_state.chunks))
-                    avg_words = stats['total_words'] // st.session_state.page_count if st.session_state.page_count > 0 else 0
-                    st.metric("Avg Words/Page", f"{avg_words:,}")
-                
-                st.markdown("---")
-                st.markdown("### 🔤 Top 10 Most Frequent Words")
-                for word, count in stats['top_words']:
-                    st.text(f"{word}: {count}")
-                
-                st.markdown("---")
-                st.markdown("### 📝 Extractive Summary")
-                st.info(stats['summary'])
+            <div className="mt-6 pt-6 border-t border-gray-200">
+              <h4 className="text-sm font-semibold text-gray-700 mb-2">Knowledge Base Preview</h4>
+              <div className="bg-gray-50 p-3 rounded text-xs text-gray-600 max-h-40 overflow-y-auto">
+                {knowledgeBase.trim().split('\n').slice(0, 5).join('\n')}...
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
-st.markdown("---")
-st.caption("Built with Streamlit, Sentence Transformers, FAISS, and DistilGPT-2 🚀")
+export default RAGChatbot;
