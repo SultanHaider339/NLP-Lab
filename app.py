@@ -1,376 +1,316 @@
 # app.py
 import streamlit as st
 import PyPDF2
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.llms import OpenAI
-import io
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+import nltk
+from collections import Counter
 import re
-from typing import List, Dict, Any
-import traceback
+import io
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Page configuration
-st.set_page_config(
-    page_title="PDF Chat & Statistics",
-    page_icon="📄",
-    layout="wide"
-)
+# Download NLTK data
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
 
-# Initialize session state variables
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "conversation_chain" not in st.session_state:
-    st.session_state.conversation_chain = None
-if "pdf_stats" not in st.session_state:
-    st.session_state.pdf_stats = None
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize, sent_tokenize
+
+# Page config
+st.set_page_config(page_title="PDF RAG Chat", page_icon="📄", layout="wide")
+
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 if "pdf_processed" not in st.session_state:
     st.session_state.pdf_processed = False
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "full_text" not in st.session_state:
+    st.session_state.full_text = ""
+if "page_count" not in st.session_state:
+    st.session_state.page_count = 0
+if "embedder" not in st.session_state:
+    st.session_state.embedder = None
+if "llm" not in st.session_state:
+    st.session_state.llm = None
+if "tokenizer" not in st.session_state:
+    st.session_state.tokenizer = None
 
 
-def extract_text_from_pdf(pdf_file) -> tuple:
-    """
-    Extract text from PDF file and return text content with page information.
-    
-    Args:
-        pdf_file: Uploaded PDF file object
-        
-    Returns:
-        tuple: (full_text, page_count, pages_list)
-    """
+@st.cache_resource
+def load_embedder():
+    """Load sentence transformer model for embeddings."""
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+
+@st.cache_resource
+def load_llm():
+    """Load local LLM for text generation."""
+    tokenizer = AutoTokenizer.from_pretrained('distilgpt2')
+    tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained('distilgpt2')
+    gen_pipeline = pipeline('text-generation', model=model, tokenizer=tokenizer, max_new_tokens=150, temperature=0.7)
+    return gen_pipeline, tokenizer
+
+
+def extract_text_from_pdf(pdf_file):
+    """Extract text from uploaded PDF file."""
     try:
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         page_count = len(pdf_reader.pages)
-        pages_text = []
         full_text = ""
         
-        for page_num, page in enumerate(pdf_reader.pages):
+        for page in pdf_reader.pages:
             text = page.extract_text()
-            pages_text.append({"page_num": page_num + 1, "text": text})
-            full_text += text + "\n"
+            if text:
+                full_text += text + "\n"
         
-        return full_text, page_count, pages_text
+        return full_text.strip(), page_count
     except Exception as e:
         st.error(f"Error reading PDF: {str(e)}")
-        return None, 0, []
+        return None, 0
 
 
-def calculate_pdf_statistics(full_text: str, page_count: int, pages_text: List[Dict]) -> Dict[str, Any]:
-    """
-    Calculate various statistics about the PDF document.
+def chunk_text(text, chunk_size=500, overlap=50):
+    """Split text into overlapping chunks."""
+    chunks = []
+    start = 0
+    text_len = len(text)
     
-    Args:
-        full_text: Complete text from PDF
-        page_count: Number of pages
-        pages_text: List of page texts
+    while start < text_len:
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        start += chunk_size - overlap
+    
+    return chunks
+
+
+def create_vector_store(chunks, embedder):
+    """Create FAISS vector store from text chunks."""
+    if not chunks:
+        return None
+    
+    embeddings = embedder.encode(chunks, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype('float32')
+    
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+    
+    return index
+
+
+def retrieve_context(query, vectorstore, chunks, embedder, top_k=3):
+    """Retrieve most relevant chunks for a query."""
+    if vectorstore is None or not chunks:
+        return ""
+    
+    query_embedding = embedder.encode([query], show_progress_bar=False)
+    query_embedding = np.array(query_embedding).astype('float32')
+    
+    distances, indices = vectorstore.search(query_embedding, top_k)
+    
+    context_chunks = [chunks[i] for i in indices[0] if i < len(chunks)]
+    return "\n\n".join(context_chunks)
+
+
+def generate_answer(query, context, llm, tokenizer):
+    """Generate answer using local LLM with retrieved context."""
+    prompt = f"Context: {context[:800]}\n\nQuestion: {query}\n\nAnswer:"
+    
+    try:
+        response = llm(prompt, max_new_tokens=100, num_return_sequences=1, do_sample=True)
+        answer = response[0]['generated_text']
         
-    Returns:
-        dict: Statistics dictionary
-    """
+        # Extract only the generated answer part
+        if "Answer:" in answer:
+            answer = answer.split("Answer:")[-1].strip()
+        else:
+            answer = answer[len(prompt):].strip()
+        
+        # Clean up the answer
+        answer = answer.split("\n")[0].strip()
+        
+        return answer if answer else "I couldn't generate a relevant answer based on the context."
+    except Exception as e:
+        return f"Error generating answer: {str(e)}"
+
+
+def calculate_statistics(text):
+    """Calculate PDF statistics."""
     # Word count
-    words = re.findall(r'\b\w+\b', full_text)
+    words = re.findall(r'\b\w+\b', text.lower())
     total_words = len(words)
-    avg_words_per_page = total_words / page_count if page_count > 0 else 0
     
-    # Character count
-    total_chars = len(full_text)
+    # Remove stopwords for frequency analysis
+    stop_words = set(stopwords.words('english'))
+    filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
     
-    # Estimate images/tables (heuristic: look for common indicators)
-    image_indicators = full_text.lower().count("image") + full_text.lower().count("figure")
-    table_indicators = full_text.lower().count("table")
+    # Most common words
+    word_freq = Counter(filtered_words)
+    top_words = word_freq.most_common(10)
     
-    # Generate simple summary (first 300 characters)
-    summary = full_text[:300].strip() + "..." if len(full_text) > 300 else full_text.strip()
+    # Extractive summary using TF-IDF
+    sentences = sent_tokenize(text)
+    if len(sentences) > 0:
+        try:
+            vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+            if len(sentences) >= 3:
+                tfidf_matrix = vectorizer.fit_transform(sentences)
+                sentence_scores = tfidf_matrix.sum(axis=1).A1
+                top_indices = sentence_scores.argsort()[-3:][::-1]
+                summary = " ".join([sentences[i] for i in sorted(top_indices)])
+            else:
+                summary = " ".join(sentences[:3])
+        except:
+            summary = " ".join(sentences[:3])
+    else:
+        summary = "No summary available."
     
-    stats = {
-        "page_count": page_count,
+    return {
         "total_words": total_words,
-        "avg_words_per_page": round(avg_words_per_page, 2),
-        "total_characters": total_chars,
-        "estimated_images": image_indicators,
-        "estimated_tables": table_indicators,
+        "top_words": top_words,
         "summary": summary
     }
-    
-    return stats
 
 
-def create_vector_store(text: str, chunk_size: int = 1000, chunk_overlap: int = 200):
-    """
-    Create vector store from text using embeddings.
-    
-    Args:
-        text: Input text to process
-        chunk_size: Size of text chunks
-        chunk_overlap: Overlap between chunks
-        
-    Returns:
-        FAISS vectorstore
-    """
-    try:
-        # Split text into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len
-        )
-        chunks = text_splitter.split_text(text)
-        
-        # Create embeddings using HuggingFace (free)
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        
-        # Create vector store
-        vectorstore = FAISS.from_texts(chunks, embeddings)
-        
-        return vectorstore
-    except Exception as e:
-        st.error(f"Error creating vector store: {str(e)}")
-        return None
-
-
-def create_conversation_chain(vectorstore, api_key: str = None):
-    """
-    Create conversational retrieval chain.
-    
-    Args:
-        vectorstore: FAISS vectorstore
-        api_key: OpenAI API key (optional)
-        
-    Returns:
-        ConversationalRetrievalChain
-    """
-    try:
-        # Use OpenAI if API key provided, otherwise show error
-        if api_key:
-            llm = OpenAI(
-                temperature=0.7,
-                openai_api_key=api_key,
-                model_name="gpt-3.5-turbo-instruct"
-            )
-        else:
-            st.warning("⚠️ No OpenAI API key provided. Please enter your API key in the sidebar.")
-            return None
-        
-        # Create memory
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
-        
-        # Create conversation chain
-        conversation_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-            memory=memory,
-            return_source_documents=True
-        )
-        
-        return conversation_chain
-    except Exception as e:
-        st.error(f"Error creating conversation chain: {str(e)}")
-        return None
-
-
-def process_pdf(pdf_file, api_key: str = None):
-    """
-    Main function to process PDF file.
-    
-    Args:
-        pdf_file: Uploaded PDF file
-        api_key: OpenAI API key
-    """
-    with st.spinner("Processing PDF..."):
-        # Extract text
-        full_text, page_count, pages_text = extract_text_from_pdf(pdf_file)
-        
-        if full_text is None or not full_text.strip():
-            st.error("Could not extract text from PDF. Please ensure the PDF contains readable text.")
-            return
-        
-        # Calculate statistics
-        stats = calculate_pdf_statistics(full_text, page_count, pages_text)
-        st.session_state.pdf_stats = stats
-        
-        # Create vector store
-        vectorstore = create_vector_store(full_text)
-        
-        if vectorstore is None:
-            st.error("Failed to create vector store.")
-            return
-        
-        st.session_state.vectorstore = vectorstore
-        
-        # Create conversation chain
-        conversation_chain = create_conversation_chain(vectorstore, api_key)
-        st.session_state.conversation_chain = conversation_chain
-        
-        st.session_state.pdf_processed = True
-        st.success("✅ PDF processed successfully! You can now chat with your document.")
-
-
-def reset_app():
-    """Reset the application state."""
-    st.session_state.chat_history = []
-    st.session_state.vectorstore = None
-    st.session_state.conversation_chain = None
-    st.session_state.pdf_stats = None
+def reset_session():
+    """Reset all session state variables."""
+    st.session_state.messages = []
     st.session_state.pdf_processed = False
+    st.session_state.vectorstore = None
+    st.session_state.chunks = []
+    st.session_state.full_text = ""
+    st.session_state.page_count = 0
 
 
-def main():
-    """Main application function."""
+# Main UI
+st.title("📄 PDF RAG Chat Application")
+st.markdown("Upload a PDF, chat with its content, and generate statistics - all running locally!")
+
+# Sidebar
+with st.sidebar:
+    st.header("📤 Upload PDF")
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
     
-    # Title
-    st.title("📄 PDF Chat & Statistics Generator")
-    st.markdown("Upload a PDF and chat with it using AI-powered Retrieval-Augmented Generation (RAG)")
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # API Key input
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            help="Enter your OpenAI API key to enable chat functionality"
-        )
-        
-        st.markdown("---")
-        
-        # File upload
-        st.header("📤 Upload PDF")
-        uploaded_file = st.file_uploader(
-            "Choose a PDF file",
-            type="pdf",
-            help="Upload a PDF file to analyze and chat with"
-        )
-        
-        if uploaded_file is not None:
-            if st.button("🔄 Process PDF"):
-                reset_app()
-                process_pdf(uploaded_file, api_key)
-        
-        # Reset button
-        if st.session_state.pdf_processed:
-            st.markdown("---")
-            if st.button("🗑️ Reset & Upload New PDF"):
-                reset_app()
-                st.rerun()
-        
-        # Statistics display
-        if st.session_state.pdf_stats:
-            st.markdown("---")
-            st.header("📊 PDF Statistics")
-            stats = st.session_state.pdf_stats
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Pages", stats["page_count"])
-                st.metric("Total Words", f"{stats['total_words']:,}")
-            with col2:
-                st.metric("Avg Words/Page", stats["avg_words_per_page"])
-                st.metric("Characters", f"{stats['total_characters']:,}")
-            
-            st.metric("Est. Images", stats["estimated_images"])
-            st.metric("Est. Tables", stats["estimated_tables"])
-            
-            st.markdown("**Document Preview:**")
-            st.text_area(
-                "First 300 characters",
-                stats["summary"],
-                height=150,
-                disabled=True
-            )
-    
-    # Main content area
-    if not st.session_state.pdf_processed:
-        # Instructions
-        st.info("""
-        ### 👋 Welcome! Here's how to use this app:
-        
-        1. **Enter your OpenAI API Key** in the sidebar (required for chat functionality)
-        2. **Upload a PDF file** using the file uploader in the sidebar
-        3. **Click "Process PDF"** to analyze the document
-        4. **View statistics** about your PDF in the sidebar
-        5. **Ask questions** about your document in the chat interface below
-        
-        #### Example Questions:
-        - "What is this document about?"
-        - "Summarize the main points"
-        - "What does page 3 discuss?"
-        - "Are there any conclusions?"
-        """)
-    else:
-        # Chat interface
-        st.header("💬 Chat with Your PDF")
-        
-        # Display chat history
-        chat_container = st.container()
-        with chat_container:
-            for i, message in enumerate(st.session_state.chat_history):
-                if message["role"] == "user":
-                    st.chat_message("user").write(message["content"])
+    if uploaded_file is not None:
+        if st.button("Process PDF", type="primary"):
+            with st.spinner("Processing PDF..."):
+                # Load models
+                if st.session_state.embedder is None:
+                    st.session_state.embedder = load_embedder()
+                if st.session_state.llm is None:
+                    st.session_state.llm, st.session_state.tokenizer = load_llm()
+                
+                # Extract text
+                full_text, page_count = extract_text_from_pdf(uploaded_file)
+                
+                if full_text:
+                    st.session_state.full_text = full_text
+                    st.session_state.page_count = page_count
+                    
+                    # Create chunks and vector store
+                    chunks = chunk_text(full_text)
+                    st.session_state.chunks = chunks
+                    
+                    vectorstore = create_vector_store(chunks, st.session_state.embedder)
+                    st.session_state.vectorstore = vectorstore
+                    
+                    st.session_state.pdf_processed = True
+                    st.success(f"✅ PDF processed! {page_count} pages, {len(chunks)} chunks created.")
                 else:
-                    st.chat_message("assistant").write(message["content"])
+                    st.error("Failed to extract text from PDF.")
+    
+    if st.session_state.pdf_processed:
+        st.markdown("---")
+        st.markdown(f"**Pages:** {st.session_state.page_count}")
+        st.markdown(f"**Chunks:** {len(st.session_state.chunks)}")
+        
+        if st.button("🗑️ Reset"):
+            reset_session()
+            st.rerun()
+
+# Main content
+if not st.session_state.pdf_processed:
+    st.info("👈 Please upload and process a PDF file to start chatting.")
+else:
+    # Tabs for chat and statistics
+    tab1, tab2 = st.tabs(["💬 Chat", "📊 Statistics"])
+    
+    with tab1:
+        st.subheader("Chat with Your PDF")
+        
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
         
         # Chat input
-        user_question = st.chat_input("Ask a question about your PDF...")
-        
-        if user_question:
-            if not st.session_state.conversation_chain:
-                st.error("❌ Please enter your OpenAI API key in the sidebar to enable chat.")
-            else:
-                # Add user message to chat history
-                st.session_state.chat_history.append({
-                    "role": "user",
-                    "content": user_question
-                })
-                
-                # Display user message
-                with st.chat_message("user"):
-                    st.write(user_question)
-                
-                # Get response
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        try:
-                            response = st.session_state.conversation_chain({
-                                "question": user_question
-                            })
-                            answer = response["answer"]
-                            
-                            # Add assistant message to chat history
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": answer
-                            })
-                            
-                            st.write(answer)
-                            
-                        except Exception as e:
-                            error_msg = f"Error generating response: {str(e)}"
-                            st.error(error_msg)
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": error_msg
-                            })
+        if prompt := st.chat_input("Ask a question about the PDF..."):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    context = retrieve_context(
+                        prompt,
+                        st.session_state.vectorstore,
+                        st.session_state.chunks,
+                        st.session_state.embedder
+                    )
+                    
+                    answer = generate_answer(
+                        prompt,
+                        context,
+                        st.session_state.llm,
+                        st.session_state.tokenizer
+                    )
+                    
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
     
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align: center; color: gray;'>"
-        "Built with Streamlit, LangChain, and HuggingFace 🤖"
-        "</div>",
-        unsafe_allow_html=True
-    )
+    with tab2:
+        st.subheader("PDF Statistics")
+        
+        if st.button("Generate Statistics", type="primary"):
+            with st.spinner("Calculating statistics..."):
+                stats = calculate_statistics(st.session_state.full_text)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.metric("Total Pages", st.session_state.page_count)
+                    st.metric("Total Words", f"{stats['total_words']:,}")
+                
+                with col2:
+                    st.metric("Total Chunks", len(st.session_state.chunks))
+                    avg_words = stats['total_words'] // st.session_state.page_count if st.session_state.page_count > 0 else 0
+                    st.metric("Avg Words/Page", f"{avg_words:,}")
+                
+                st.markdown("---")
+                st.markdown("### 🔤 Top 10 Most Frequent Words")
+                for word, count in stats['top_words']:
+                    st.text(f"{word}: {count}")
+                
+                st.markdown("---")
+                st.markdown("### 📝 Extractive Summary")
+                st.info(stats['summary'])
 
-
-if __name__ == "__main__":
-    main()
+st.markdown("---")
+st.caption("Built with Streamlit, Sentence Transformers, FAISS, and DistilGPT-2 🚀")
