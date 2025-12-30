@@ -1,285 +1,313 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Send, Loader2, FileText, Trash2, BookOpen } from 'lucide-react';
+# app.py
+import streamlit as st
+import PyPDF2
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import nltk
+from collections import Counter
+import re
+import textstat
+import torch
 
-const RAGChatbot = () => {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [context, setContext] = useState('');
-  const [showContext, setShowContext] = useState(false);
-  const messagesEndRef = useRef(null);
+# Download NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.corpus import stopwords
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+# Configure page
+st.set_page_config(page_title="PDF RAG Chat", page_icon="📄", layout="wide")
 
-  // Sample knowledge base - in a real app, this would be from uploaded documents
-  const knowledgeBase = `
-    Claude is an AI assistant created by Anthropic. Claude is helpful, harmless, and honest.
+# Hugging Face API token
+HF_TOKEN = "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"
+
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "pdf_processed" not in st.session_state:
+    st.session_state.pdf_processed = False
+if "pdf_text" not in st.session_state:
+    st.session_state.pdf_text = ""
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "stats" not in st.session_state:
+    st.session_state.stats = {}
+if "embedder" not in st.session_state:
+    st.session_state.embedder = None
+if "tokenizer" not in st.session_state:
+    st.session_state.tokenizer = None
+if "model" not in st.session_state:
+    st.session_state.model = None
+
+
+@st.cache_resource
+def load_embedding_model():
+    """Load sentence transformer model for embeddings."""
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+
+@st.cache_resource
+def load_generation_model():
+    """Load Hugging Face generative model and tokenizer."""
+    tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base', token=HF_TOKEN)
+    model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base', token=HF_TOKEN)
+    return tokenizer, model
+
+
+def extract_text_from_pdf(pdf_file):
+    """Extract all text from PDF file."""
+    try:
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip(), len(pdf_reader.pages)
+    except Exception as e:
+        st.error(f"Error reading PDF: {str(e)}")
+        return None, 0
+
+
+def chunk_text(text, chunk_size=500, overlap=50):
+    """Split text into overlapping chunks."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks
+
+
+def create_faiss_index(chunks, embedder):
+    """Create FAISS index from text chunks."""
+    embeddings = embedder.encode(chunks, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype('float32')
     
-    Anthropic was founded in 2021 by Dario Amodei and Daniela Amodei, along with several other former members of OpenAI.
-    The company focuses on AI safety and research.
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
     
-    Claude can help with a wide variety of tasks including writing, analysis, math, coding, and creative projects.
-    Claude is designed to be helpful, harmless, and honest in all interactions.
+    return index
+
+
+def retrieve_relevant_chunks(query, index, chunks, embedder, top_k=3):
+    """Retrieve most relevant chunks for a query."""
+    query_embedding = embedder.encode([query], show_progress_bar=False)
+    query_embedding = np.array(query_embedding).astype('float32')
     
-    The latest version of Claude is part of the Claude 3 model family, which includes Claude 3 Opus, Claude 3 Sonnet, and Claude 3 Haiku.
-    These models offer different balances of intelligence, speed, and cost.
-  `;
-
-  // Simple keyword-based retrieval (mimics vector similarity)
-  const retrieveRelevantContext = (query) => {
-    const sentences = knowledgeBase.split('\n').filter(s => s.trim());
-    const queryWords = query.toLowerCase().split(' ');
+    distances, indices = index.search(query_embedding, min(top_k, len(chunks)))
     
-    // Score each sentence based on keyword matches
-    const scoredSentences = sentences.map(sentence => {
-      const sentenceLower = sentence.toLowerCase();
-      const score = queryWords.reduce((acc, word) => {
-        return acc + (sentenceLower.includes(word) ? 1 : 0);
-      }, 0);
-      return { sentence, score };
-    });
+    relevant_chunks = [chunks[i] for i in indices[0] if i < len(chunks)]
+    return " ".join(relevant_chunks)
 
-    // Get top 3 relevant sentences
-    const topSentences = scoredSentences
-      .filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 3)
-      .map(s => s.sentence);
 
-    return topSentences.join('\n');
-  };
-
-  // Simulate API call to Hugging Face model
-  const generateResponse = async (userMessage, relevantContext) => {
-    // In a real implementation, you would call Hugging Face API here
-    // For demo purposes, we'll create a rule-based response
+def generate_response(query, context, tokenizer, model):
+    """Generate response using FLAN-T5 with context."""
+    prompt = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
     
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate API delay
-
-    const messageLower = userMessage.toLowerCase();
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
     
-    if (!relevantContext) {
-      return "I don't have enough information in my knowledge base to answer that question. Please try asking something else or add more context to my knowledge base.";
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=200,
+            num_beams=4,
+            early_stopping=True,
+            temperature=0.7
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response
+
+
+def calculate_statistics(text, page_count):
+    """Calculate various statistics about the PDF."""
+    # Word count
+    words = word_tokenize(text.lower())
+    total_words = len([w for w in words if w.isalnum()])
+    
+    # Sentence count
+    sentences = sent_tokenize(text)
+    total_sentences = len(sentences)
+    
+    # Most frequent words (excluding stopwords)
+    stop_words = set(stopwords.words('english'))
+    filtered_words = [w for w in words if w.isalnum() and w not in stop_words and len(w) > 2]
+    word_freq = Counter(filtered_words)
+    top_words = word_freq.most_common(10)
+    
+    # Readability score
+    try:
+        flesch_score = textstat.flesch_reading_ease(text)
+        readability = f"{flesch_score:.2f} (Flesch Reading Ease)"
+    except:
+        readability = "N/A"
+    
+    return {
+        "pages": page_count,
+        "words": total_words,
+        "sentences": total_sentences,
+        "avg_words_per_page": round(total_words / page_count, 2) if page_count > 0 else 0,
+        "top_words": top_words,
+        "readability": readability
     }
 
-    // Create a contextual response based on retrieved information
-    let response = "Based on the information I have:\n\n";
+
+def process_pdf(pdf_file):
+    """Main function to process uploaded PDF."""
+    with st.spinner("Processing PDF..."):
+        # Extract text
+        text, page_count = extract_text_from_pdf(pdf_file)
+        
+        if not text:
+            st.error("Could not extract text from PDF.")
+            return
+        
+        st.session_state.pdf_text = text
+        
+        # Calculate statistics
+        stats = calculate_statistics(text, page_count)
+        st.session_state.stats = stats
+        
+        # Load models if not already loaded
+        if st.session_state.embedder is None:
+            with st.spinner("Loading embedding model..."):
+                st.session_state.embedder = load_embedding_model()
+        
+        if st.session_state.tokenizer is None or st.session_state.model is None:
+            with st.spinner("Loading generation model..."):
+                st.session_state.tokenizer, st.session_state.model = load_generation_model()
+        
+        # Create chunks and index
+        chunks = chunk_text(text)
+        st.session_state.chunks = chunks
+        
+        index = create_faiss_index(chunks, st.session_state.embedder)
+        st.session_state.index = index
+        
+        st.session_state.pdf_processed = True
+        st.success(f"✅ PDF processed successfully! {page_count} pages, {len(chunks)} chunks created.")
+
+
+def reset_app():
+    """Reset application state."""
+    st.session_state.messages = []
+    st.session_state.pdf_processed = False
+    st.session_state.pdf_text = ""
+    st.session_state.chunks = []
+    st.session_state.index = None
+    st.session_state.stats = {}
+
+
+# Main UI
+st.title("📄 PDF RAG Chat & Statistics")
+st.markdown("Upload a PDF to chat with its content and view statistics")
+
+# Sidebar
+with st.sidebar:
+    st.header("📤 Upload PDF")
     
-    if (messageLower.includes('who') || messageLower.includes('what is claude')) {
-      response += "Claude is an AI assistant created by Anthropic, designed to be helpful, harmless, and honest. ";
-    } else if (messageLower.includes('anthropic')) {
-      response += "Anthropic was founded in 2021 by Dario Amodei and Daniela Amodei. The company focuses on AI safety and research. ";
-    } else if (messageLower.includes('help') || messageLower.includes('do')) {
-      response += "Claude can help with various tasks including writing, analysis, math, coding, and creative projects. ";
-    } else if (messageLower.includes('version') || messageLower.includes('model')) {
-      response += "The latest Claude models are part of the Claude 3 family, which includes Opus, Sonnet, and Haiku variants. ";
-    } else {
-      response += relevantContext.split('\n')[0] + " ";
-    }
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
     
-    response += "\n\nIs there anything specific you'd like to know more about?";
+    if uploaded_file is not None:
+        if st.button("Process PDF", type="primary"):
+            reset_app()
+            process_pdf(uploaded_file)
     
-    return response;
-  };
+    if st.session_state.pdf_processed:
+        st.markdown("---")
+        st.subheader("📊 PDF Statistics")
+        
+        stats = st.session_state.stats
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Pages", stats["pages"])
+            st.metric("Words", f"{stats['words']:,}")
+        with col2:
+            st.metric("Sentences", f"{stats['sentences']:,}")
+            st.metric("Avg Words/Page", stats["avg_words_per_page"])
+        
+        st.markdown(f"**Readability:** {stats['readability']}")
+        
+        st.markdown("**Top 10 Words:**")
+        for word, count in stats["top_words"]:
+            st.text(f"• {word}: {count}")
+        
+        st.markdown("---")
+        if st.button("🗑️ Reset", type="secondary"):
+            reset_app()
+            st.rerun()
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return;
+# Main content
+if not st.session_state.pdf_processed:
+    st.info("👈 Please upload and process a PDF file to start chatting")
+    
+    st.markdown("### How to use:")
+    st.markdown("""
+    1. Upload a PDF file using the sidebar
+    2. Click 'Process PDF' to analyze the document
+    3. View statistics in the sidebar
+    4. Ask questions about the PDF content in the chat
+    """)
+else:
+    st.subheader("💬 Chat with PDF")
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a question about the PDF..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    # Retrieve relevant context
+                    context = retrieve_relevant_chunks(
+                        prompt,
+                        st.session_state.index,
+                        st.session_state.chunks,
+                        st.session_state.embedder
+                    )
+                    
+                    # Generate response
+                    response = generate_response(
+                        prompt,
+                        context,
+                        st.session_state.tokenizer,
+                        st.session_state.model
+                    )
+                    
+                    # Handle empty responses
+                    if not response.strip():
+                        response = "I couldn't generate a relevant answer. Please try rephrasing your question."
+                    
+                    st.markdown(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    
+                except Exception as e:
+                    error_msg = f"Error generating response: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-    const userMessage = input.trim();
-    setInput('');
-    setLoading(true);
-
-    // Add user message
-    const newMessages = [...messages, { role: 'user', content: userMessage }];
-    setMessages(newMessages);
-
-    try {
-      // Retrieve relevant context using RAG
-      const relevantContext = retrieveRelevantContext(userMessage);
-      setContext(relevantContext);
-
-      // Generate response using the context
-      const response = await generateResponse(userMessage, relevantContext);
-
-      // Add assistant message
-      setMessages([...newMessages, { role: 'assistant', content: response }]);
-    } catch (error) {
-      setMessages([...newMessages, { 
-        role: 'assistant', 
-        content: 'Sorry, I encountered an error. Please try again.' 
-      }]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  const clearChat = () => {
-    setMessages([]);
-    setContext('');
-  };
-
-  return (
-    <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
-      {/* Header */}
-      <div className="bg-white shadow-md border-b border-gray-200 p-4">
-        <div className="max-w-4xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="bg-indigo-600 p-2 rounded-lg">
-              <BookOpen className="text-white" size={24} />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold text-gray-800">RAG Chatbot</h1>
-              <p className="text-sm text-gray-600">Powered by Retrieval-Augmented Generation</p>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={() => setShowContext(!showContext)}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition-colors"
-            >
-              <FileText size={18} />
-              {showContext ? 'Hide' : 'Show'} Context
-            </button>
-            <button
-              onClick={clearChat}
-              className="flex items-center gap-2 px-4 py-2 bg-red-100 text-red-700 rounded-lg hover:bg-red-200 transition-colors"
-            >
-              <Trash2 size={18} />
-              Clear
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Main Content */}
-      <div className="flex-1 overflow-hidden flex max-w-4xl w-full mx-auto gap-4 p-4">
-        {/* Chat Area */}
-        <div className={`flex flex-col bg-white rounded-xl shadow-lg overflow-hidden transition-all ${showContext ? 'w-2/3' : 'w-full'}`}>
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {messages.length === 0 ? (
-              <div className="flex items-center justify-center h-full">
-                <div className="text-center space-y-4">
-                  <div className="bg-indigo-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto">
-                    <BookOpen className="text-indigo-600" size={32} />
-                  </div>
-                  <h2 className="text-2xl font-semibold text-gray-700">Welcome to RAG Chatbot!</h2>
-                  <p className="text-gray-500 max-w-md">
-                    This chatbot uses Retrieval-Augmented Generation to answer questions based on a knowledge base.
-                    Try asking about Claude or Anthropic!
-                  </p>
-                  <div className="bg-gray-50 p-4 rounded-lg max-w-md mx-auto text-left">
-                    <p className="text-sm font-semibold text-gray-700 mb-2">Try asking:</p>
-                    <ul className="text-sm text-gray-600 space-y-1">
-                      <li>• What is Claude?</li>
-                      <li>• Who founded Anthropic?</li>
-                      <li>• What can Claude help with?</li>
-                      <li>• What are the Claude 3 models?</li>
-                    </ul>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <>
-                {messages.map((message, index) => (
-                  <div
-                    key={index}
-                    className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div
-                      className={`max-w-[80%] rounded-2xl px-4 py-3 ${
-                        message.role === 'user'
-                          ? 'bg-indigo-600 text-white'
-                          : 'bg-gray-100 text-gray-800'
-                      }`}
-                    >
-                      <p className="whitespace-pre-wrap">{message.content}</p>
-                    </div>
-                  </div>
-                ))}
-                {loading && (
-                  <div className="flex justify-start">
-                    <div className="bg-gray-100 rounded-2xl px-4 py-3 flex items-center gap-2">
-                      <Loader2 className="animate-spin text-indigo-600" size={18} />
-                      <span className="text-gray-600">Thinking...</span>
-                    </div>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </>
-            )}
-          </div>
-
-          {/* Input Area */}
-          <div className="border-t border-gray-200 p-4 bg-gray-50">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyPress={handleKeyPress}
-                placeholder="Ask me anything about Claude or Anthropic..."
-                className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                disabled={loading}
-              />
-              <button
-                onClick={handleSend}
-                disabled={loading || !input.trim()}
-                className="px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-              >
-                {loading ? (
-                  <Loader2 className="animate-spin" size={20} />
-                ) : (
-                  <Send size={20} />
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Context Panel */}
-        {showContext && (
-          <div className="w-1/3 bg-white rounded-xl shadow-lg p-6 overflow-y-auto">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
-              <FileText size={20} className="text-indigo-600" />
-              Retrieved Context
-            </h3>
-            {context ? (
-              <div className="bg-indigo-50 p-4 rounded-lg">
-                <p className="text-sm text-gray-700 whitespace-pre-wrap">{context}</p>
-              </div>
-            ) : (
-              <div className="text-center text-gray-400 py-8">
-                <FileText size={48} className="mx-auto mb-2 opacity-50" />
-                <p className="text-sm">No context retrieved yet</p>
-                <p className="text-xs mt-1">Ask a question to see relevant information</p>
-              </div>
-            )}
-            
-            <div className="mt-6 pt-6 border-t border-gray-200">
-              <h4 className="text-sm font-semibold text-gray-700 mb-2">Knowledge Base Preview</h4>
-              <div className="bg-gray-50 p-3 rounded text-xs text-gray-600 max-h-40 overflow-y-auto">
-                {knowledgeBase.trim().split('\n').slice(0, 5).join('\n')}...
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
-export default RAGChatbot;
+# Footer
+st.markdown("---")
+st.caption("Built with Streamlit, Sentence Transformers, FAISS, and FLAN-T5")
